@@ -1,0 +1,26 @@
+{
+  "site": {
+    "title": "Jin-uu",
+    "base_url": "https://jin-uu.github.io",
+    "base_path": "/",
+    "favicon": "/favicon.png",
+    "logoLight": "https://github.com/jin-uu.png",
+    "logoDark": "https://github.com/jin-uu.png",
+    "lang": "en",
+    "description": "Tech blog",
+    "pageSize": 6
+  },
+  "features": {
+    "youtube": false,
+    "dark_mode": true
+  },
+  "metadata": {
+    "meta_author": "Jin-uu @jin-uu",
+    "meta_description": "Tech blog"
+  },
+  "author": {
+    "name": "Jin-uu",
+    "avatar": "https://github.com/jin-uu.png",
+    "bio": "Software Engineer. @jin-uu"
+  }
+}
