@@ -1,0 +1,542 @@
+---
+title: 'Python에서 매개 변수 파싱 최적화를 통한 35% 성능 향상'
+description: 'Python의 함수를 호출할 때, 어떤 방식을 사용해서 매개 변수를 파싱하냐에 따라 성능은 크게 변합니다. 함수가 같은 로직을 수행하더라도 말이죠..!'
+pubDate: 'August 01 2025'
+heroImage: '/thumbnails/parsing-argument-35-faster.png'
+categories: ['Less-Slow']
+authors: ['Jin-uu']
+tags: ['C', 'Python', 'SIMD', 'CPython', 'function', 'less-slow']
+---
+# 서론
+
+Python은 함수의 매개변수와 관련해서 두 가지 호출 방법을 제공합니다.
+
+### 1. Positional-argument
+
+: 함수 호출 시점, 위치(순서)를 통해 식별되는 매개변수
+
+### 2. Keyword-argument (i.g., Named-argument)
+
+: 함수 호출 시점, 명시적으로 작성한 이름을 통해 식별되는 매개변수
+
+예제 코드를 살펴봅시다.
+
+```python
+def cdist(
+	A, B, /,
+	metric = 'cosine', *,
+	thread=1, dtype=None, out_dtype=None):
+	// DO SOMETHING
+```
+
+위 `cdist` 함수는, **SciPy**를 모방해 만든 [SimSIMD](https://github.com/ashvardanian/simsimd?tab=readme-ov-file#many-to-many-all-pairs-distances)에서 제공하는 함수입니다. 이 함수의 6개의 매개변수는 각각 Positional-argument, Keyword-argument 중 어떤 것에 해당할까요?
+
+- `A`, `B` : Positional-argument
+- `metric` : Positional-argument, Keyword-argument 두 방법으로 모두 전달 가능
+- `thread`, `dtype`, `out_dtype` : Keyword-argument
+
+본 포스트에서는 이러한 Python의 매개변수 전달 방식, 그리고 전달된 매개변수를 파싱하는 방식에 따라 비용과 성능이 어떻게 달라지는지 설명합니다. 본격적으로 이 내용을 다루기 이전, 좋은 API 함수 설계 원칙, 그리고, `__init__.pyi`에서 현재 `cdist` 선언이 [이러한 모습](https://github.com/ashvardanian/SimSIMD/blob/4145c81b737b6ff5f32e8885da329a8f0e9585c7/python/annotations/__init__.pyi#L110-L121)인 이유에 대해 알아봅시다.
+
+# Good Design Principles
+
+어떤 API 함수를 작성할 때, 우리는 **사용자가 이 함수를 잘못 호출할 여지를 최대한 줄이도록** 설계해야 합니다. 아래는 `cdist`를 잘못 호출한 예시들 입니다.
+
+```c
+cdist()            # TypeError: cdist() missing 2 required positional arguments: 'A' and 'B'
+cdist(A)           # TypeError: cdist() missing 1 required positional argument: 'B'
+cdist(A, B=B)      # TypeError: cdist() got some positional-only arguments passed as keyword arguments: 'B'
+cdist(A, B, '', 1) # TypeError: cdist() takes from 2 to 3 positional arguments but 4 were given
+```
+
+위 에러 메세지를 살펴보면, 꽤 구체적으로 제공되며, 사용자는 쉽게 디버깅 후, `cdist`를 정상적으로 호출할 수 있을 것입니다. 이처럼, 함수의 정의 방법 자체가 Readability, Writability, Reliability에 큰 영향을 줍니다. 그럼 어떤 것이 좋은 함수 정의 방법일까요?
+
+### **`*args` 와 `**kwargs` 의 사용 최소화**
+
+Python에서 가장 쉽게 접할 수 있는 “Code-smell”은 `*args`, `**kwargs` 즉, **가변 매개변수**의 무분별한 사용입니다. 이는 임의의 개수의 매개변수(Positional / Keyword 둘 다)를 넘겨줄 수 있도록 도와줍니다. 예제 코드를 살펴봅시다.
+
+```python
+def process_data(*args, **kwargs):
+     print(f"Processing {len(args)} positional arguments of type {type(args)}")
+     print(f"Processing {len(kwargs)} keyword arguments of type {type(kwargs)}")
+     for key, value in kwargs.items():
+         print(f"- {key}: {value}")
+process_data(10, 11, a=12, b=13)
+```
+
+위 코드의 결과는 아래와 같습니다.
+
+```python
+Processing 2 positional arguments of type <class 'tuple'>
+Processing 2 keyword arguments of type <class 'dict'>
+- a: 12
+- b: 13
+```
+
+가변 매개변수는 유연하고, 편리한 면도 있습니다. 그러나, 사용자가 함수 내부를 직접 봐야 어떤 매개변수가 전달되어야 하는지 알 수 있습니다. 최악의 경우 함수와 관련된 여러 파일들을 오가며 함수를 이해해야 합니다. 아래는 그 예시입니다.
+
+```python
+class BaseAction:
+    def __init__(self, *args, **kwargs):
+        self.user = kwargs.get('user', 'guest')
+        self.verbose = kwargs.get('verbose', False)
+
+    def execute(self, *args, **kwargs):
+        print(f"Executing base action as {self.user}")
+        if self.verbose:
+            print("Verbose mode in base action")
+
+class FileCleanupAction(BaseAction):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.file_path = kwargs.get('file_path', None)
+
+    def execute(self, *args, **kwargs):
+        print(f"Cleaning up file: {self.file_path}")
+        super().execute(*args, **kwargs)
+
+class DatabaseBackupAction(BaseAction):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.db_name = kwargs.get('db_name', None)
+
+    def execute(self, *args, **kwargs):
+        print(f"Backing up database: {self.db_name}")
+        super().execute(*args, **kwargs)
+```
+
+사용자가 위 Class들의 execute를 호출하려면, 전달할 매개변수들이 어떤 것인지, 직접 코드를 보며 이해해야 합니다.
+
+이러한 코드는 꽤 쉽게 접할 수 있습니다. Hugging Face의 Transformers, LangChain처럼 AI 분야에서 가장 잘 알려진 레포지토리조차 이러한 문제를 보이고 있습니다. 이런 식으로 인수를 처리하면 **개발자는 편하지만 end-user는** 고통스러울 것입니다. 반면, SimSIMD의 `__init__.pyi`에는 `*args`나 `**kwargs`가 **단 하나도 없습니다**. (대박)
+
+### **Default Arguments and Type Annotations**
+
+가변 매개변수를 사용하지 않고, 모든 매개변수를 명시적으로 작성했다면, 다음 단계는 각 매개변수의 **타입과 기본값을 지정**하는 작업이 필요합니다. 예시 코드를 살펴봅시다.
+
+```python
+from typing import List
+
+def f(x: List = []):
+    x += (len(x),)
+    return x
+```
+
+위 코드는 매개변수 `x`에 대한 타입, 기본값을 명시했습니다. 그러나 주의해야할 점이 있습니다.
+
+- Python의 타입 주석은 **런타임에 아무 영향이 없으므로** `tuple`이나 `set`를 전달해도 그대로 동작한다
+- 기본값은 **함수 정의 시점에 한번만 초기화** 된다
+
+아래 호출 예제를 보면,
+
+```python
+print(f())          # [0]
+print(f())          # [0, 1]
+print(f(tuple()))   # (0,)
+print(f())          # [0, 1, 2]
+print(f(set()))     # `TypeError: unsupported operand type(s) for +=: 'set' and 'tuple'`
+```
+
+위와 같이 의도하지 않은 동작이 일어날 수 있으므로 주의해야 합니다.
+
+### Python Version
+
+또한, 필수 라이브러리 의존성 누락, Python 버전 불일치 역시 주의해야 합니다.
+
+```python
+from typing import Optional, TypeAlias
+from numpy.typing import NDArray
+
+MetricType: TypeAlias = Literal['cosine', 'sqeuclidean']
+
+def cdist(
+    A: NDArray, B: NDArray, /,
+    metric: MetricType = 'cosine', *,
+    threads: int = 1, dtype: Optional[str] = None, out_dtype: Optional[str] = None) -> NDArray:
+  	// DO SOMETHING
+```
+
+**Python 3.10**에서는 LSP와 정적 타입 체킹을 위해 **TypeAlias**를 도입했습니다. 그리고 **3.12**에서 TypeAlias는 **type 문으로 대체**되었습니다. 따라서, 3.10, 3.12 버전을 기준으로 Type 지정을 어떤 방식으로 해야하는지 주의해서 작성해야 합니다.
+
+### Library Recompile
+
+만약 우리가 **다중 플랫폼**을 대상으로 코드를 작성하는 경우, 어떤 라이브러리를 사용하냐에 따라 큰 문제가 발생할 수도 있다.
+
+```python
+from typing import Optional
+from numpy import ndarray
+
+def cdist(
+    A: ndarray, B: ndarray, /,
+    metric: str = 'cosine', *,
+    threads: int = 1, dtype: Optional[str] = None, out_dtype: Optional[str] = None) -> ndarray:
+  	// DO SOMETHING
+```
+
+2025년 8월 1일 기준 최신 **NumPy**는 v2.3.2, 최신 **SimSIMD**는 v6.5.0 입니다.
+
+- NumPy v2.3.2은 **73개** 사전 컴파일 바이너리를 제공
+- SimSIMD v6.5.0은 **97개** 사전 컴파일 바이너리를 제공
+
+> 사전 컴파일 바이너리란, 휠 파일(.whl)로, 파이썬 패키지를 배포/설치할 때 사용하는 표준 바이너리 형식입니다.
+> 
+
+`A`, `B`의 타입을 `np.ndarray` 로 지정했습니다. **SimSIMD**에서 제공하는 함수인 `cdist`의 매개변수 타입을 Numpy에서 제공하는 `ndarray`로 지정했기 때문에 Numpy에는 의존성이 걸리게 됩니다. 따라서 사전에 컴파일 된 97개 중 73개를 제외한 24개를 NumPy 의존성 때문에 직접 다시 컴파일해야 합니다. 그러나, 이 과정에서 대부분의 경우 빌드 기본 툴인 `cibuildwheel`에서 매우 오랫동안 빌드되며, 최악의 경우 timeout으로 실패합니다.
+
+이를 해결하는 방법 중 하나는, Python에 내장된 CPython 버퍼 타입인  `memoryview` 를 사용하는 것입니다. Numpy와 같은 외부 라이브러리가 아닌, 공식 내장 타입인 `memoryview`를 사용하면 위와 같은 문제를 해결할 수 있습니다. 이어서 코드 이식성을 높일 수 있고, PyTorch, TensorFlow 같은 다른 텐서 라이브러리와 쉽게 호환 가능합니다.
+
+```python
+from typing import Optional
+
+def cdist(
+    A: memoryview, B: memoryview, /,
+    metric: str = 'cosine', *,
+    threads: int = 1, dtype: Optional[str] = None, out_dtype: Optional[str] = None) -> memoryview:
+  	// DO SOMETHING
+```
+
+위와 같이 내장 라이브러리에서 제공하는 `memoryview`를 사용해 라이브러리 의존성을 제거할 수 있습니다.
+
+# 성능 향상
+
+이제 본격적으로 성능 측면에서 함수의 매개변수 파싱 방법에 대해 알아봅시다.
+
+### **`PyArg_ParseTuple` 과 `PyArg_ParseTupleAndKeywords` 사용**
+
+Python은 동적인 언어입니다. 또한, CPython 객체는 최대한 유연하게 동작하도록 설계되었습니다. 그러나 이런 유연성에는 트레이드 오프가 존재하는데, 바로 성능입니다.
+
+1. CPython에서 대부분의 프로퍼티 탐색은 딕셔너리 순회, 비싼 문자열 비교, 메모리 할당을 수반합니다.
+2. 대부분의 사전 컴파일된 네이티브(C/C++) 확장 모듈은 **PyBind11** 같은 **high-level 래퍼를 사용**해 매개변수를 파싱하며, 이는 보통 더 느립니다.
+
+[CPython 문서](https://docs.python.org/3/c-api/arg.html#c.PyArg_Parse)를 열어보면 다음과 같은 설명이 있습니다.
+
+> The first three of these functions described, [`PyArg_ParseTuple()`](https://docs.python.org/3/c-api/arg.html#c.PyArg_ParseTuple), [`PyArg_ParseTupleAndKeywords()`](https://docs.python.org/3/c-api/arg.html#c.PyArg_ParseTupleAndKeywords), and [`PyArg_Parse()`](https://docs.python.org/3/c-api/arg.html#c.PyArg_Parse), all use format strings which are used to tell the function about the expected arguments. The format strings use the same syntax for each of these functions.
+> 
+
+이 함수들 중`PyArg_ParseTupleAndKeywords()` 를 사용해 `cdist`를 수정해보겠습니다. 이 함수를 C 네이티브 환경에서 사용하는 것은 생각보다 쉽습니다. 아래 예제를 살펴봅시다.
+
+```c
+static PyObject* api_cdist(PyObject* self, PyObject* args, PyObject* kwargs) {
+    PyObject* input_tensor_a = NULL;    // Required object, positional-only
+    PyObject* input_tensor_b = NULL;    // Required object, positional-only
+    char const* metric_str = NULL;      // Optional string, positional or keyword
+    unsigned long long threads = 1;     // Optional integer, keyword-only
+    char const* dtype_str = NULL;       // Optional string, keyword-only
+    char const* out_dtype_str = NULL;   // Optional string, keyword-only
+
+    static char* kwlist[] = {"input_tensor_a", "input_tensor_b", "metric", "threads", "dtype", "out_dtype", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|s$Kss", kwlist, &input_tensor_a, &input_tensor_b, &metric_str,
+                                     &threads, &dtype_str, &out_dtype_str))
+        return NULL;
+}
+```
+
+기존 `cdist` 함수를 수정한 위 코드에서는 `PyArg_ParseTupleAndKeywords` 함수에 `"OO|s$Kss"`와 같은 [format specifiers](https://docs.python.org/3/c-api/arg.html#parsing-arguments) 를 사용해 매개변수를 파싱합니다. 이제 SimSIMD를 다시 컴파일 한 뒤, 간단한 스크립트를 작성해 성능을 측정해 보겠습니다.
+
+```python
+import numpy as np
+from simsimd import cdist
+
+a = np.random.randn(16).astype("float16")
+b = np.random.randn(16).astype("float16")
+
+for _ in range(10_000_000):
+    cdist(
+        a,
+        b,
+        metric="sqeuclidean",
+        threads=1,
+        dtype="float16",
+        out_dtype="float64",
+    )
+```
+
+결과는 다음과 같습니다.
+
+```bash
+$ time python dispatch.py
+> real    0m 5.592s
+> user    0m 6.875s
+> sys     0m 0.018s
+```
+
+이제 Keyword-argument로 전달한 매개변수를 주석처리한 뒤, 다시 성능을 측정해보겠습니다. 이러면 `PyArg_ParseTupleAndKeywords` 의 호출은 발생하지 않습니다.
+
+```python
+import numpy as np
+from simsimd import cdist
+
+a = np.random.randn(16).astype("float16")
+b = np.random.randn(16).astype("float16")
+
+for _ in range(10_000_000):
+    cdist(
+        a,
+        b,
+        # metric="sqeuclidean",
+        # threads=1,
+        # dtype="float16",
+        # out_dtype="float64",
+    )
+```
+
+결과는 다음과 같습니다.
+
+```bash
+$ time python dispatch.py
+> real    0m 2.281s
+> user    0m 3.509s
+> sys     0m 0.013s
+```
+
+같은 로직을 수행했음에도 성능 차이는 2배 가까이 났습니다. 여기서 우리는 매개변수를 파싱하는데 상당한 오버헤드가 발생하는 것을 알 수 있습니다. 심지어 메인 로직보다 더 걸리게 될지도 모릅니다. 이제 이 매개변수를 파싱하는 로직을 최적화 해봅시다.
+
+### Manually Unpacking Arguments
+
+`PyTuple_GetItem` 과 `PyDict_GetItem` 를 사용해 위에서 `PyArg_ParseTupleAndKeywords` 를 사용한 방식보다 성능을 개선시켜봅시다.
+
+```c
+static PyObject* api_cdist(PyObject* self, PyObject* args, PyObject* kwargs) {
+    // This function accepts up to 6 arguments:
+    PyObject* input_tensor_a = NULL; // Required object, positional-only
+    PyObject* input_tensor_b = NULL; // Required object, positional-only
+    PyObject* metric_obj = NULL;     // Optional string, positional or keyword
+    PyObject* threads_obj = NULL;    // Optional integer, keyword-only
+    PyObject* dtype_obj = NULL;      // Optional string, keyword-only
+    PyObject* out_dtype_obj = NULL;  // Optional string, keyword-only
+
+		// Checking for positional arguments in args
+    if (!PyTuple_Check(args) || PyTuple_Size(args) < 2 || PyTuple_Size(args) > 3) {
+        PyErr_SetString(PyExc_TypeError, "Function expects 2-3 positional arguments");
+        return NULL;
+    }
+
+    input_tensor_a = PyTuple_GetItem(args, 0);
+    input_tensor_b = PyTuple_GetItem(args, 1);
+    if (PyTuple_Size(args) > 2)
+        metric_obj = PyTuple_GetItem(args, 2);
+
+    // Checking for named arguments in kwargs
+    if (kwargs) {
+        threads_obj = PyDict_GetItemString(kwargs, "threads");
+        dtype_obj = PyDict_GetItemString(kwargs, "dtype");
+        out_dtype_obj = PyDict_GetItemString(kwargs, "out_dtype");
+        int count_extracted = (threads_obj != NULL) + (dtype_obj != NULL) + (out_dtype_obj != NULL);
+
+        if (!metric_obj) {
+            metric_obj = PyDict_GetItemString(kwargs, "metric");
+            count_extracted += metric_obj != NULL;
+        } else if (PyDict_GetItemString(kwargs, "metric")) {
+            PyErr_SetString(PyExc_ValueError, "Duplicate argument for 'metric'");
+            return NULL;
+        }
+
+        // Check for unknown arguments
+        int count_received = PyDict_Size(kwargs);
+        if (count_received > count_extracted) {
+            PyErr_SetString(PyExc_ValueError, "Received unknown keyword argument");
+            return NULL;
+        }
+    }
+
+    // Once parsed, the arguments will be stored in these variables:
+    char const* metric_str = NULL;
+    unsigned long long threads = 1;
+    char const* dtype_str = NULL;
+    char const* out_dtype_str = NULL;
+    // The rest is pretty much the same, except for some type checks for `metric_obj`, 
+    // `threads_obj`, `dtype_obj`, and `out_dtype_obj`.
+```
+
+함수가 호출되어 매개변수가 전달될 때, 함수 내부에서 받게 되는 것은 결국 `tuple`과 `dict`입니다. Positional-argument는 `tuple`, Keyword-argument는 `dict`로 전달됩니다. 따라서 `PyTuple_GetItem` 과 `PyDict_GetItemString` 를 사용하면 전달된 각 매개변수를 파싱할 수 있습니다. 이제 SimSIMD를 다시 컴파일해 성능을 측정해보면 다음과 같은 결과를 얻을 수 있습니다.
+
+```bash
+$ time python dispatch.py 
+> real    0m 4.489s
+> user    0m 5.805s
+> sys     0m 0.019s
+```
+
+`PyArg_ParseTupleAndKeywords` 대비 약 **15% 성능이 향상**되었습니다.
+
+### Manually Unpacking in a Single Pass
+
+`PyDict_GetItemString`을 여러 번 호출하면 그 때마다 `dict`를 탐색하게 됩니다. `dict`는 해시 테이블로 구현되므로 조회 시간이 O(1)이지만, 상수 시간은 여전히 존재하며, 이는 무시할만한 수준이 아닐수도 있습니다. 아래 코드를 살펴봅시다.
+
+```c
+static PyObject* api_cdist(PyObject* self, PyObject* args, PyObject* kwargs) {
+    // This function accepts up to 6 arguments:
+    PyObject* input_tensor_a = NULL; // Required object, positional-only
+    PyObject* input_tensor_b = NULL; // Required object, positional-only
+    PyObject* metric_obj = NULL;     // Optional string, positional or keyword
+    PyObject* threads_obj = NULL;    // Optional integer, keyword-only
+    PyObject* dtype_obj = NULL;      // Optional string, keyword-only
+    PyObject* out_dtype_obj = NULL;  // Optional string, keyword-only
+    
+		// Checking for positional arguments in args
+    if (!PyTuple_Check(args) || PyTuple_Size(args) < 2 || PyTuple_Size(args) > 3) {
+        PyErr_SetString(PyExc_TypeError, "Function expects 2-3 positional arguments");
+        return NULL;
+    }
+
+    input_tensor_a = PyTuple_GetItem(args, 0);
+    input_tensor_b = PyTuple_GetItem(args, 1);
+    if (PyTuple_Size(args) > 2)
+        metric_obj = PyTuple_GetItem(args, 2);
+
+    // Checking for named arguments in kwargs
+    if (kwargs) {
+        Py_ssize_t pos = 0;
+        PyObject* key;
+        PyObject* value;
+
+        while (PyDict_Next(kwargs, &pos, &key, &value)) {
+            if (PyUnicode_CompareWithASCIIString(key, "threads") == 0) {
+                if (threads_obj != NULL) {
+                    PyErr_SetString(PyExc_ValueError, "Duplicate argument for 'threads'");
+                    return NULL;
+                }
+                threads_obj = value;
+            } else if (PyUnicode_CompareWithASCIIString(key, "dtype") == 0) {
+                if (dtype_obj != NULL) {
+                    PyErr_SetString(PyExc_ValueError, "Duplicate argument for 'dtype'");
+                    return NULL;
+                }
+                dtype_obj = value;
+            } else if (PyUnicode_CompareWithASCIIString(key, "out_dtype") == 0) {
+                if (out_dtype_obj != NULL) {
+                    PyErr_SetString(PyExc_ValueError, "Duplicate argument for 'out_dtype'");
+                    return NULL;
+                }
+                out_dtype_obj = value;
+            } else if (PyUnicode_CompareWithASCIIString(key, "metric") == 0) {
+                if (metric_obj != NULL) {
+                    PyErr_SetString(PyExc_ValueError, "Duplicate argument for 'metric'");
+                    return NULL;
+                }
+                metric_obj = value;
+            } else {
+                PyErr_Format(PyExc_ValueError, "Received unknown keyword argument: %O", key);
+                return NULL;
+            }
+        }
+    }
+
+    // Once parsed, the arguments will be stored in these variables:
+    char const* metric_str = NULL;
+    unsigned long long threads = 1;
+    char const* dtype_str = NULL;
+    char const* out_dtype_str = NULL;
+```
+
+전달된 모든 인수를 변수에 할당하는 경우, `PyDict_Next` 를 사용해 한번의 순회만으로 매개변수를 파싱할 수 있습니다. 모든 매개변수 마다 `dict`를 순회한 이전 방식과는 달리 `dict`를 순회하면서 대응되는 매개변수를 찾는 것이죠. 또한, `PyUnicode_CompareWithASCIIString` 를 사용하면 문자열을 `unpack` 할 필요 없이 곧바로 비교할 수 있습니다. 이제 SimSIMD를 다시 컴파일 한 후 성능을 측정해봅시다.
+
+```bash
+$ time python dispatch.py 
+> real    0m 3.572s
+> user    0m 4.806s
+> sys     0m 0.013s
+```
+
+이전 단계보다 `약 17% 향상`(5.805s → 4.806s)되었습니다.
+
+### **Faster Calling Conventions**
+
+CPython 3.8에서 도입되고 3.9부터 공개된 **PEP 590**는 매개변수 파싱 최적화를 수행하는데 용이합니다. 이는 callable 객체를 위한 Vectorcall-protocol입니다. 이는 함수 매개변수를 파싱할 때, `tuple`이나 `dict`를 사용하지 않고도 매개변수를 파싱할 수 있도록 합니다. 또한 `_PyCFunctionFast` 함수를 정의할 때 사용하는 `METH_FASTCALL` 플래그와, `_PyCFunctionFastWithKeywords` 함수를 정의할 때 사용하는 `METH_FASTCALL | METH_KEYWORDS` 를 조합하면 더욱 성능을 끌어올릴 수 있습니다.
+
+```c
+PyObject *_PyCFunctionFast(
+    PyObject *self,
+    PyObject *const *args,
+    Py_ssize_t args_count);
+
+PyObject *_PyCFunctionFastWithKeywords(
+    PyObject *self,
+    PyObject *const *args,       // positional arguments in a C-style array of pointers
+    Py_ssize_t args_count,       // number of positional arguments in the prefix of `args`
+    PyObject *args_names_tuple); // named arguments in the tail of `args`, forming a Python `tuple`
+```
+
+두 번째 함수 `_PyCFunctionFastWithKeywords` 를 사용하면 `dict`를 사용하지 않고도 매개변수 파싱을 수행할 수 있습니다. 아래 예제 코드를 살펴봅시다. 매개변수 파싱 이후 로직은 생략했습니다. 함수 전체는 [여기](https://github.com/ashvardanian/SimSIMD/blob/main-dev/python/lib.c#L1235)서 확인할 수 있습니다.
+
+```c
+static PyObject *api_cdist( //
+    PyObject *self, PyObject *const *args, Py_ssize_t const positional_args_count, PyObject *args_names_tuple) {
+
+    // This function accepts up to 7 arguments - more than SciPy:
+    // https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.distance.cdist.html
+    PyObject *a_obj = NULL;         // Required object, positional-only
+    PyObject *b_obj = NULL;         // Required object, positional-only
+    PyObject *metric_obj = NULL;    // Optional string, "metric" keyword or positional
+    PyObject *out_obj = NULL;       // Optional object, "out" keyword-only
+    PyObject *dtype_obj = NULL;     // Optional string, "dtype" keyword-only
+    PyObject *out_dtype_obj = NULL; // Optional string, "out_dtype" keyword-only
+    PyObject *threads_obj = NULL;   // Optional integer, "threads" keyword-only
+
+    // Once parsed, the arguments will be stored in these variables:
+    unsigned long long threads = 1;
+    char const *dtype_str = NULL, *out_dtype_str = NULL;
+    simsimd_datatype_t dtype = simsimd_datatype_unknown_k, out_dtype = simsimd_datatype_unknown_k;
+
+    /// Same default as in SciPy:
+    /// https://docs.scipy.org/doc/scipy-1.11.4/reference/generated/scipy.spatial.distance.cdist.html
+    simsimd_metric_kind_t metric_kind = simsimd_metric_euclidean_k;
+    char const *metric_str = NULL;
+
+    // Parse the arguments
+    Py_ssize_t const args_names_count = args_names_tuple ? PyTuple_Size(args_names_tuple) : 0;
+    Py_ssize_t const args_count = positional_args_count + args_names_count;
+    if (args_count < 2 || args_count > 7) {
+        PyErr_Format(PyExc_TypeError, "Function expects 2-7 arguments, got %zd", args_count);
+        return NULL;
+    }
+    if (positional_args_count > 3) {
+        PyErr_Format(PyExc_TypeError, "Only first 3 arguments can be positional, received %zd", positional_args_count);
+        return NULL;
+    }
+
+    // Positional-only arguments (first and second matrix)
+    a_obj = args[0];
+    b_obj = args[1];
+
+    // Positional or keyword arguments (metric)
+    if (positional_args_count == 3) metric_obj = args[2];
+
+    // The rest of the arguments must be checked in the keyword dictionary:
+    for (Py_ssize_t args_names_tuple_progress = 0, args_progress = positional_args_count;
+         args_names_tuple_progress < args_names_count; ++args_progress, ++args_names_tuple_progress) {
+        PyObject *const key = PyTuple_GetItem(args_names_tuple, args_names_tuple_progress);
+        PyObject *const value = args[args_progress];
+        if (PyUnicode_CompareWithASCIIString(key, "dtype") == 0 && !dtype_obj) { dtype_obj = value; }
+        else if (PyUnicode_CompareWithASCIIString(key, "out") == 0 && !out_obj) { out_obj = value; }
+        else if (PyUnicode_CompareWithASCIIString(key, "out_dtype") == 0 && !out_dtype_obj) { out_dtype_obj = value; }
+        else if (PyUnicode_CompareWithASCIIString(key, "threads") == 0 && !threads_obj) { threads_obj = value; }
+        else if (PyUnicode_CompareWithASCIIString(key, "metric") == 0 && !metric_obj) { metric_obj = value; }
+        else {
+            PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", key);
+            return NULL;
+        }
+    }
+
+    // Convert `metric_obj` to `metric_str` and to `metric_kind`
+    // Convert `threads_obj` to `threads` integer
+    // Convert `dtype_obj` to `dtype_str` and to `dtype`
+    // Convert `out_dtype_obj` to `out_dtype_str` and to `out_dtype`
+    return implement_cdist(a_obj, b_obj, out_obj, metric_kind, threads, dtype, out_dtype);
+}
+```
+
+ 이제 SimSIMD를 다시 컴파일 한 후 성능을 측정해봅시다.
+
+```bash
+$ time python dispatch.py 
+> real    0m 3.141s
+> user    0m 4.453s
+> sys     0m 0.023s
+```
+
+이전 단계보다 약 7% 향상(4.806s → 4.453s)되었습니다.
+
+가장 초기 단계와 비교했을 때는 약 35.2% 향상(6.875s → 4.453s)되었습니다.
+
+# 마무리
+
+이번 포스트에서는 함수 메인 로직을 건드리지 않고서도 매개변수 파싱 방법을 최적화 함으로써 큰 성능 향상을 이룰 수 있는 방법에 대해 알아보았습니다. Python에서 매개변수 파싱을 최적화하는 일은 처음 봤을 때는 다소 마이너한 작업처럼 보일 수 있지만, 앞서 살펴본 바와 같이 특정한 ****어플리케이션에서는 상당한 성능 향상을 가져올 수 있습니다. 이 최적화 방식은 단순히 이론에 그치지 않고 실제 시스템에 즉각적으로 적용할 수 있다는 점에서 강력합니다. 현재 대부분의 SimSIMD 커널 래퍼는 fast calling conventions을 사용합니다. 특히, SimSIMD v5.1에 새로 추가된 대규모 정보 검색 시스템에서 매우 흔하게 사용되는 sparse operations에서 이를 통해 큰 성능 향상을 이뤘습니다.
